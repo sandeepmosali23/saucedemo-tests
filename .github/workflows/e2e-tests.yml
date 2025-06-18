@@ -1,0 +1,367 @@
+name: E2E Tests with TypeScript
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run tests daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  NODE_VERSION: '18'
+
+jobs:
+  # Type checking and linting job
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run type-check
+
+      - name: Lint code
+        run: npm run lint
+
+      - name: Check formatting
+        run: npm run format -- --check
+
+  # E2E testing job
+  e2e-tests:
+    name: E2E Tests
+    needs: code-quality
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        browser: [chromium, firefox, webkit]
+        node-version: [16, 18, 20]
+        exclude:
+          # WebKit is not supported on Windows/Linux
+          - os: ubuntu-latest
+            browser: webkit
+          - os: windows-latest
+            browser: webkit
+          # Reduce matrix size by testing only LTS Node versions on non-Ubuntu
+          - os: windows-latest
+            node-version: 16
+          - os: windows-latest
+            node-version: 20
+          - os: macos-latest
+            node-version: 16
+          - os: macos-latest
+            node-version: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Run E2E tests
+        run: npx playwright test --project=${{ matrix.browser }}
+        env:
+          CI: true
+          BROWSER: ${{ matrix.browser }}
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.os }}-${{ matrix.browser }}-node${{ matrix.node-version }}
+          path: |
+            test-results/
+            playwright-report/
+            monocart-report/
+          retention-days: 7
+
+      - name: Upload Monocart results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: monocart-results-${{ matrix.os }}-${{ matrix.browser }}-node${{ matrix.node-version }}
+          path: monocart-report/
+          retention-days: 7
+
+  # Mobile testing job
+  mobile-tests:
+    name: Mobile E2E Tests
+    needs: code-quality
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        device: [mobile-chrome, mobile-safari]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      - name: Run mobile tests
+        run: npx playwright test --project=${{ matrix.device }}
+        env:
+          CI: true
+
+      - name: Upload mobile test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mobile-test-results-${{ matrix.device }}
+          path: |
+            test-results/
+            playwright-report/
+            monocart-report/
+          retention-days: 7
+
+  # Performance testing job
+  performance-tests:
+    name: Performance Tests
+    needs: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run performance tests
+        run: npx playwright test --grep="@performance" --project=chromium
+        env:
+          CI: true
+
+      - name: Upload performance results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-test-results
+          path: |
+            test-results/
+            playwright-report/
+            monocart-report/
+          retention-days: 7
+
+  # Generate and publish reports
+  publish-reports:
+    name: Publish Test Reports
+    needs: [e2e-tests, mobile-tests]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Merge test results
+        run: |
+          mkdir -p merged-results/test-results
+          mkdir -p merged-results/monocart-report
+          find artifacts/ -name "test-results" -type d -exec cp -r {}/* merged-results/test-results/ \;
+          find artifacts/ -name "monocart-report" -type d -exec cp -r {}/* merged-results/monocart-report/ \;
+
+      - name: Generate Monocart report
+        run: |
+          npm install -g monocart-reporter
+          # Monocart report is generated during test execution
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        if: github.ref == 'refs/heads/main'
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: merged-results/monocart-report
+
+      - name: Comment PR with report link
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const reportUrl = `https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🧪 Test Results\n\n✅ E2E tests completed!\n\n📊 [View detailed Monocart report](${reportUrl})\n\n**Test Summary:**\n- Browsers tested: Chrome, Firefox, Safari\n- Mobile devices tested: Chrome Mobile, Safari Mobile\n- Node.js versions: 16, 18, 20\n- Operating systems: Ubuntu, Windows, macOS\n\n**Report Features:**\n- 🎯 Interactive test results with filters\n- 📈 Performance metrics and trends\n- 🖼️ Screenshots and videos for failures\n- 📱 Mobile-friendly responsive design`
+            });
+
+  # Security scan job
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run security audit
+        run: npm audit --audit-level=moderate
+
+      - name: Run CodeQL analysis
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+
+  # Notification job
+  notify:
+    name: Notify Team
+    needs: [e2e-tests, mobile-tests, performance-tests, security-scan]
+    runs-on: ubuntu-latest
+    if: always() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+
+    steps:
+      - name: Determine status
+        id: status
+        run: |
+          if [[ "${{ needs.e2e-tests.result }}" == "success" && "${{ needs.mobile-tests.result }}" == "success" && "${{ needs.performance-tests.result }}" == "success" ]]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "color=good" >> $GITHUB_OUTPUT
+            echo "emoji=✅" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "color=danger" >> $GITHUB_OUTPUT
+            echo "emoji=❌" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Notify Slack
+        uses: rtCamp/action-slack-notify@v2
+        if: env.SLACK_WEBHOOK != ''
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CHANNEL: '#qa-automation'
+          SLACK_USERNAME: 'GitHub Actions'
+          SLACK_COLOR: ${{ steps.status.outputs.color }}
+          SLACK_TITLE: '${{ steps.status.outputs.emoji }} E2E Tests ${{ steps.status.outputs.status }}'
+          SLACK_MESSAGE: |
+            *Repository:* ${{ github.repository }}
+            *Branch:* ${{ github.ref_name }}
+            *Commit:* ${{ github.sha }}
+            *Author:* ${{ github.actor }}
+            *Workflow:* ${{ github.workflow }}
+            *Status:* ${{ steps.status.outputs.status }}
+            
+            *Test Results:*
+            • Desktop Tests: ${{ needs.e2e-tests.result }}
+            • Mobile Tests: ${{ needs.mobile-tests.result }}
+            • Performance Tests: ${{ needs.performance-tests.result }}
+            • Security Scan: ${{ needs.security-scan.result }}
+
+      - name: Notify Teams
+        uses: skitionek/notify-microsoft-teams@master
+        if: env.TEAMS_WEBHOOK != ''
+        with:
+          webhook_url: ${{ secrets.TEAMS_WEBHOOK }}
+          needs: ${{ toJson(needs) }}
+          job: ${{ toJson(job) }}
+          steps: ${{ toJson(steps) }}
+
+  # Cleanup job
+  cleanup:
+    name: Cleanup Artifacts
+    needs: [publish-reports]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Delete old artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+            });
+
+            // Keep only the latest 5 artifacts per type
+            const artifactGroups = {};
+            artifacts.data.artifacts.forEach(artifact => {
+              const baseName = artifact.name.split('-').slice(0, -2).join('-');
+              if (!artifactGroups[baseName]) {
+                artifactGroups[baseName] = [];
+              }
+              artifactGroups[baseName].push(artifact);
+            });
+
+            for (const [groupName, groupArtifacts] of Object.entries(artifactGroups)) {
+              groupArtifacts.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+              const toDelete = groupArtifacts.slice(5);
+            
+              for (const artifact of toDelete) {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                });
+                console.log(`Deleted artifact: ${artifact.name}`);
+              }
+            }
